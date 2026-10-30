@@ -49,8 +49,7 @@ def run_web_server():
 load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TMDB_TOKEN = os.getenv("TMDB_READ_ACCESS_TOKEN", "").strip()
-TMDB_KEY = os.getenv("TMDB_API_KEY", "").strip()
+ANILIST_API_URL = os.getenv("ANILIST_API_URL", "https://graphql.anilist.co").strip()
 
 WATCH_NOW_URL = os.getenv(
     "WATCH_NOW_URL", "https://t.me/YourChannelUsername"
@@ -60,8 +59,6 @@ JOIN_TELEGRAM_URL = os.getenv(
 ).strip()
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@YourChannelUsername").strip()
 
-API = "https://api.themoviedb.org/3"
-IMG = "https://image.tmdb.org/t/p/"
 LOGO = Path(__file__).parent / "assets" / "channel_logo.jpg"
 TEMPLATES_DIR = Path(os.getenv("TEMPLATES_DIR", str(Path(__file__).parent / "assets" / "templates")))
 TEMPLATES_FILE = TEMPLATES_DIR / "templates.json"
@@ -110,82 +107,75 @@ log = logging.getLogger("ANIFLIX-INFINITY")
 
 http = requests.Session()
 http.headers["Accept"] = "application/json"
-if TMDB_TOKEN:
-    http.headers["Authorization"] = "Bearer " + TMDB_TOKEN
+# -------------------- AniList helpers --------------------
 
-
-# -------------------- TMDB helpers --------------------
-
-def api(path, params=None):
-    params = dict(params or {})
-    if not TMDB_TOKEN:
-        if not TMDB_KEY:
-            raise RuntimeError(
-                "Add TMDB_READ_ACCESS_TOKEN or TMDB_API_KEY to Render Environment."
-            )
-        params["api_key"] = TMDB_KEY
-
-    response = http.get(API + path, params=params, timeout=25)
-    if response.status_code == 401:
-        raise RuntimeError(
-            "TMDB credential rejected. Check your Render Environment variables."
-        )
+def anilist_request(query, variables):
+    response = http.post(
+        ANILIST_API_URL,
+        json={"query": query, "variables": variables},
+        timeout=30,
+    )
     response.raise_for_status()
-    return response.json()
+    payload = response.json()
+    if payload.get("errors"):
+        raise RuntimeError("AniList lookup failed: " + str(payload["errors"][0].get("message", "unknown error")))
+    return payload.get("data", {})
 
 
 def search(query):
+    gql = """
+    query ($search: String) {
+      Page(page: 1, perPage: 8) {
+        media(search: $search, type: ANIME, sort: [SEARCH_MATCH, POPULARITY_DESC]) {
+          id
+          title { romaji english native }
+          startDate { year }
+          coverImage { extraLarge large }
+          averageScore
+        }
+      }
+    }
+    """
+    data = anilist_request(gql, {"search": query})
     results = []
-    for kind in ("tv", "movie"):
-        data = api(
-            "/search/" + kind,
-            {
-                "query": query,
-                "include_adult": "false",
-                "language": "en-US",
-                "page": 1,
-            },
-        )
-        for item in data.get("results", []):
-            item["kind"] = kind
-            item["title"] = (
-                item.get("name")
-                or item.get("title")
-                or item.get("original_name")
-                or item.get("original_title")
-                or "Untitled"
-            )
-            item["date"] = (
-                item.get("first_air_date") or item.get("release_date") or ""
-            )
-            results.append(item)
-
-    results.sort(key=lambda item: item.get("popularity", 0), reverse=True)
-    return [item for item in results if item.get("poster_path")][:8]
+    for media in data.get("Page", {}).get("media", []):
+        titles = media.get("title") or {}
+        title = titles.get("english") or titles.get("romaji") or titles.get("native") or "Untitled"
+        cover = media.get("coverImage") or {}
+        results.append({
+            "id": media["id"],
+            "title": title,
+            "date": str((media.get("startDate") or {}).get("year") or ""),
+            "poster_url": cover.get("extraLarge") or cover.get("large"),
+        })
+    return [item for item in results if item.get("poster_url")]
 
 
 def details(item):
-    data = api(f"/{item['kind']}/{item['id']}", {"language": "en-US"})
+    gql = """
+    query ($id: Int) {
+      Media(id: $id, type: ANIME) {
+        id
+        title { romaji english native }
+        description(asHtml: false)
+        startDate { year }
+        averageScore
+        genres
+        coverImage { extraLarge large }
+      }
+    }
+    """
+    media = anilist_request(gql, {"id": int(item["id"])}).get("Media") or {}
+    titles = media.get("title") or {}
+    score = media.get("averageScore") or 0
+    cover = media.get("coverImage") or {}
     return {
-        "title": data.get("name") or data.get("title") or item["title"],
-        "overview": (
-            data.get("overview")
-            or item.get("overview")
-            or "Synopsis unavailable."
-        ).strip(),
-        "year": (
-            data.get("first_air_date")
-            or data.get("release_date")
-            or item.get("date")
-            or ""
-        )[:4],
-        "rating": data.get("vote_average") or item.get("vote_average") or 0,
-        "genres": [
-            genre["name"]
-            for genre in data.get("genres", [])
-            if genre.get("name")
-        ][:3],
-        "poster_path": data.get("poster_path") or item.get("poster_path"),
+        "title": titles.get("english") or titles.get("romaji") or titles.get("native") or item["title"],
+        "overview": re.sub(r"<[^>]+>", "", media.get("description") or "Synopsis unavailable."),
+        "year": str((media.get("startDate") or {}).get("year") or item.get("date") or ""),
+        "rating": round(float(score) / 10, 1) if score else 0,
+        "genres": (media.get("genres") or [])[:3],
+        "poster_url": cover.get("extraLarge") or cover.get("large") or item.get("poster_url"),
     }
 
 
@@ -335,10 +325,10 @@ def draw_telegram_join(draw, x, y, width, channel_username):
 
 def make_poster(info, template_path=None):
     settings = load_bot_settings()
-    if not info.get("poster_path"):
+    if not info.get("poster_url"):
         raise RuntimeError("No poster artwork found.")
 
-    response = http.get(IMG + "w780" + info["poster_path"], timeout=30)
+    response = http.get(info["poster_url"], timeout=30)
     response.raise_for_status()
     poster = Image.open(io.BytesIO(response.content)).convert("RGB")
 
@@ -435,7 +425,7 @@ def make_poster(info, template_path=None):
         metadata.append(info["year"])
     if info.get("rating"):
         try:
-            metadata.append(f"TMDB ★ {float(info['rating']):.1f}/10")
+            metadata.append(f"AniList ★ {float(info['rating']):.1f}/10")
         except (ValueError, TypeError):
             pass
 
@@ -863,7 +853,7 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    message = await update.effective_message.reply_text("🔎 Searching TMDB…")
+    message = await update.effective_message.reply_text("🔎 Searching AniList…")
     try:
         items = search(query)
         if not items:
@@ -915,7 +905,7 @@ async def synopsis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data["year"]:
             message += f"\n\n📅 Year: {data['year']}"
         if data["rating"]:
-            message += f"\n⭐ TMDB rating: {float(data['rating']):.1f}/10"
+            message += f"\n⭐ AniList rating: {float(data['rating']):.1f}/10"
         if data["genres"]:
             message += "\n🎭 Genres: " + ", ".join(data["genres"])
         settings = load_bot_settings()
@@ -1002,11 +992,7 @@ async def text_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not BOT_TOKEN:
         raise SystemExit("Missing TELEGRAM_BOT_TOKEN in Render Environment.")
-    if not TMDB_TOKEN and not TMDB_KEY:
-        raise SystemExit(
-            "Missing TMDB_READ_ACCESS_TOKEN or TMDB_API_KEY in Render Environment."
-        )
-
+    
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))

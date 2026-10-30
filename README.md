@@ -1,12 +1,12 @@
 # ANIFLIX INFINITY Poster Bot
 
-Telegram anime-poster bot that searches TMDB and creates 16:9 (1920×1080) posters with anime artwork, synopsis, year, rating, genres, quality badges, a Telegram join banner, and the supplied **ANIFLIX INFINITY** logo.
+Telegram anime-poster bot that searches AniList and creates 16:9 (1920×1080) posters with anime artwork, synopsis, year, rating, genres, quality badges, a Telegram join banner, and the supplied **ANIFLIX INFINITY** logo.
 
 ## Setup
 1. Create a bot with Telegram @BotFather and copy its token.
-2. Create a TMDB account and get an API Read Access Token or API key: https://developer.themoviedb.org/docs/getting-started
+2. No AniList account, API key, or access token is required for public anime metadata.
 3. Extract this ZIP and copy `.env.example` to `.env`.
-4. Add `TELEGRAM_BOT_TOKEN`, `TMDB_READ_ACCESS_TOKEN` (or `TMDB_API_KEY`) and your numeric Telegram user ID as `ADMIN_USER_ID`.
+4. Add `TELEGRAM_BOT_TOKEN` and your numeric Telegram user ID as `ADMIN_USER_ID`. `ANILIST_API_URL` is optional because the bot defaults to `https://graphql.anilist.co`.
 5. Install Python 3.11+, then run `pip install -r requirements.txt`.
 6. Start the bot with `python bot.py`.
 
@@ -44,4 +44,4 @@ For Render persistence, attach a persistent disk mounted at `/var/data` and set 
 ## Environment variables
 See `.env.example`. `CHANNEL_USERNAME`, `WATCH_NOW_URL`, and `JOIN_TELEGRAM_URL` are optional defaults; they can be changed later with the admin commands above.
 
-TMDB supplies metadata and poster artwork. Check TMDB's terms and artwork rights before public or commercial distribution.
+AniList supplies anime metadata, average scores, genres, descriptions, and cover artwork through its public API. The bot is now anime-focused; movie and general TV-series searches are not provided by AniList.
