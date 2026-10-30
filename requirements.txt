@@ -1,0 +1,9 @@
+python-telegram-bot>=21.10,<22.0
+requests>=2.32,<3.0
+Pillow>=10.4,<13.0
+python-dotenv>=1.0,<2.0
+python-telegram-bot
+Pillow
+requests
+python-dotenv
+flask

@@ -1,0 +1,1041 @@
+import asyncio
+import html
+import hashlib
+import io
+import json
+import logging
+import os
+import re
+import threading
+from pathlib import Path
+
+import requests
+from dotenv import load_dotenv
+from flask import Flask
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# -------------------- Render health server --------------------
+
+web_app = Flask(__name__)
+
+
+@web_app.route("/")
+def home():
+    return "Anime Poster Bot is running!", 200
+
+
+@web_app.route("/health")
+def health():
+    return "OK", 200
+
+
+def run_web_server():
+    port = int(os.environ.get("PORT", "10000"))
+    web_app.run(host="0.0.0.0", port=port, use_reloader=False)
+
+
+# -------------------- Configuration --------------------
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TMDB_TOKEN = os.getenv("TMDB_READ_ACCESS_TOKEN", "").strip()
+TMDB_KEY = os.getenv("TMDB_API_KEY", "").strip()
+
+WATCH_NOW_URL = os.getenv(
+    "WATCH_NOW_URL", "https://t.me/YourChannelUsername"
+).strip()
+JOIN_TELEGRAM_URL = os.getenv(
+    "JOIN_TELEGRAM_URL", "https://t.me/YourChannelUsername"
+).strip()
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@YourChannelUsername").strip()
+
+API = "https://api.themoviedb.org/3"
+IMG = "https://image.tmdb.org/t/p/"
+LOGO = Path(__file__).parent / "assets" / "channel_logo.jpg"
+TEMPLATES_DIR = Path(os.getenv("TEMPLATES_DIR", str(Path(__file__).parent / "assets" / "templates")))
+TEMPLATES_FILE = TEMPLATES_DIR / "templates.json"
+SETTINGS_FILE = TEMPLATES_DIR / "bot_settings.json"
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "").strip()
+
+W, H = 1920, 1080
+DEFAULT_QUALITIES = ["480P", "720P", "1080P"]
+DEFAULT_QUALITY = "  •  ".join(DEFAULT_QUALITIES)
+DEFAULT_AUDIO = "Tamil Audio"
+DEFAULT_JOIN = f"Telegram Join → {CHANNEL_USERNAME}"
+DEFAULT_BRAND = "ANIFLIX INFINITY"
+
+
+def load_bot_settings():
+    """Load editable channel details, keeping environment values as defaults."""
+    defaults = {
+        "channel_username": CHANNEL_USERNAME,
+        "watch_now_url": WATCH_NOW_URL,
+        "join_telegram_url": JOIN_TELEGRAM_URL,
+        "brand_name": DEFAULT_BRAND,
+    }
+    try:
+        TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+        if SETTINGS_FILE.exists():
+            saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            if isinstance(saved, dict):
+                defaults.update({key: str(value).strip() for key, value in saved.items() if key in defaults and value is not None})
+    except (OSError, ValueError, json.JSONDecodeError):
+        log.exception("Could not load bot settings")
+    return defaults
+
+
+def save_bot_settings(settings):
+    TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+    temp_file = SETTINGS_FILE.with_suffix(".tmp")
+    temp_file.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    temp_file.replace(SETTINGS_FILE)
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("ANIFLIX-INFINITY")
+
+http = requests.Session()
+http.headers["Accept"] = "application/json"
+if TMDB_TOKEN:
+    http.headers["Authorization"] = "Bearer " + TMDB_TOKEN
+
+
+# -------------------- TMDB helpers --------------------
+
+def api(path, params=None):
+    params = dict(params or {})
+    if not TMDB_TOKEN:
+        if not TMDB_KEY:
+            raise RuntimeError(
+                "Add TMDB_READ_ACCESS_TOKEN or TMDB_API_KEY to Render Environment."
+            )
+        params["api_key"] = TMDB_KEY
+
+    response = http.get(API + path, params=params, timeout=25)
+    if response.status_code == 401:
+        raise RuntimeError(
+            "TMDB credential rejected. Check your Render Environment variables."
+        )
+    response.raise_for_status()
+    return response.json()
+
+
+def search(query):
+    results = []
+    for kind in ("tv", "movie"):
+        data = api(
+            "/search/" + kind,
+            {
+                "query": query,
+                "include_adult": "false",
+                "language": "en-US",
+                "page": 1,
+            },
+        )
+        for item in data.get("results", []):
+            item["kind"] = kind
+            item["title"] = (
+                item.get("name")
+                or item.get("title")
+                or item.get("original_name")
+                or item.get("original_title")
+                or "Untitled"
+            )
+            item["date"] = (
+                item.get("first_air_date") or item.get("release_date") or ""
+            )
+            results.append(item)
+
+    results.sort(key=lambda item: item.get("popularity", 0), reverse=True)
+    return [item for item in results if item.get("poster_path")][:8]
+
+
+def details(item):
+    data = api(f"/{item['kind']}/{item['id']}", {"language": "en-US"})
+    return {
+        "title": data.get("name") or data.get("title") or item["title"],
+        "overview": (
+            data.get("overview")
+            or item.get("overview")
+            or "Synopsis unavailable."
+        ).strip(),
+        "year": (
+            data.get("first_air_date")
+            or data.get("release_date")
+            or item.get("date")
+            or ""
+        )[:4],
+        "rating": data.get("vote_average") or item.get("vote_average") or 0,
+        "genres": [
+            genre["name"]
+            for genre in data.get("genres", [])
+            if genre.get("name")
+        ][:3],
+        "poster_path": data.get("poster_path") or item.get("poster_path"),
+    }
+
+
+# -------------------- Image helpers --------------------
+
+def font(size, bold=False):
+    paths = [
+        (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+            if bold
+            else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        ),
+        (
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"
+            if bold
+            else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"
+        ),
+    ]
+    for path in paths:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def wrap(draw, text, fnt, maxw):
+    lines, current = [], ""
+    for word in text.split():
+        test = (current + " " + word).strip()
+        if draw.textbbox((0, 0), test, font=fnt)[2] <= maxw:
+            current = test
+        else:
+            if current:
+                lines.append(current)
+            if draw.textbbox((0, 0), word, font=fnt)[2] > maxw:
+                current = ""
+                for char in word:
+                    candidate = current + char
+                    if draw.textbbox((0, 0), candidate, font=fnt)[2] <= maxw:
+                        current = candidate
+                    else:
+                        if current:
+                            lines.append(current)
+                        current = char
+            else:
+                current = word
+    if current:
+        lines.append(current)
+    return lines
+
+
+def put_lines(draw, lines, xy, fnt, fill, gap=12, stroke=0, stroke_fill="#000"):
+    x, y = xy
+    for line in lines:
+        draw.text(
+            (x, y), line, font=fnt, fill=fill,
+            stroke_width=stroke, stroke_fill=stroke_fill,
+        )
+        bounds = draw.textbbox((x, y), line, font=fnt, stroke_width=stroke)
+        y += bounds[3] - bounds[1] + gap
+    return y
+
+
+def centered_text(draw, box, text, fnt, fill):
+    x1, y1, x2, y2 = box
+    bounds = draw.textbbox((0, 0), text, font=fnt)
+    text_w = bounds[2] - bounds[0]
+    text_h = bounds[3] - bounds[1]
+    x = x1 + (x2 - x1 - text_w) // 2
+    y = y1 + (y2 - y1 - text_h) // 2 - bounds[1]
+    draw.text((x, y), text, font=fnt, fill=fill)
+
+
+def draw_quality_buttons(draw, x, y, max_width):
+    """Large, individually readable 480P / 720P / 1080P badges."""
+    labels = DEFAULT_QUALITIES
+    gap = 20
+    button_h = 70
+    button_w = 190
+    label_font = font(30, True)
+
+    total_width = len(labels) * button_w + (len(labels) - 1) * gap
+    if total_width > max_width:
+        button_w = (max_width - gap * (len(labels) - 1)) // len(labels)
+
+    for index, label in enumerate(labels):
+        x1 = x + index * (button_w + gap)
+        x2 = x1 + button_w
+        draw.rounded_rectangle(
+            (x1, y, x2, y + button_h),
+            radius=16,
+            fill="#FFC857",
+            outline="#FFFFFF",
+            width=3,
+        )
+        centered_text(
+            draw, (x1, y, x2, y + button_h), label, label_font, "#171923"
+        )
+
+
+def draw_telegram_join(draw, x, y, width, channel_username):
+    """Draw a large blue Telegram-style banner with a paper-plane mark."""
+    height = 82
+    draw.rounded_rectangle(
+        (x, y, x + width, y + height),
+        radius=19,
+        fill="#168DE2",
+        outline="#FFFFFF",
+        width=3,
+    )
+
+    cx, cy, radius = x + 51, y + height // 2, 29
+    draw.ellipse(
+        (cx - radius, cy - radius, cx + radius, cy + radius),
+        fill="#FFFFFF",
+    )
+    draw.polygon(
+        [
+            (cx - 17, cy - 10),
+            (cx + 19, cy - 19),
+            (cx + 8, cy + 19),
+            (cx, cy + 5),
+            (cx - 9, cy + 12),
+            (cx - 7, cy - 1),
+        ],
+        fill="#168DE2",
+    )
+
+    label = f"JOIN TELEGRAM  {channel_username}"
+    label_font = font(30, True)
+    available_width = width - 105
+    while draw.textbbox((0, 0), label, font=label_font)[2] > available_width:
+        if label_font.size <= 18:
+            break
+        label_font = font(label_font.size - 1, True)
+
+    bounds = draw.textbbox((0, 0), label, font=label_font)
+    text_h = bounds[3] - bounds[1]
+    draw.text(
+        (x + 96, y + (height - text_h) // 2 - bounds[1]),
+        label,
+        font=label_font,
+        fill="#FFFFFF",
+    )
+
+
+def make_poster(info, template_path=None):
+    settings = load_bot_settings()
+    if not info.get("poster_path"):
+        raise RuntimeError("No poster artwork found.")
+
+    response = http.get(IMG + "w780" + info["poster_path"], timeout=30)
+    response.raise_for_status()
+    poster = Image.open(io.BytesIO(response.content)).convert("RGB")
+
+    if template_path:
+        # The uploaded blank template is the fixed background. Dynamic anime
+        # artwork and text are drawn into the reserved left/right areas below.
+        with Image.open(template_path) as template_image:
+            canvas = ImageOps.fit(
+                template_image.convert("RGB"),
+                (W, H),
+                method=Image.Resampling.LANCZOS,
+            ).convert("RGBA")
+    else:
+        bg = ImageOps.fit(
+            poster, (W, H), method=Image.Resampling.LANCZOS
+        ).filter(ImageFilter.GaussianBlur(28))
+        bg = Image.eval(bg, lambda pixel: int(pixel * 0.36)).convert("RGBA")
+        bg.alpha_composite(Image.new("RGBA", (W, H), (5, 7, 18, 125)))
+        canvas = bg
+
+    # Original vertical poster artwork on the left.
+    poster_w, poster_h = poster.size
+    display_h = 820
+    display_w = int(poster_w * display_h / poster_h)
+    if display_w > 590:
+        display_w, display_h = 590, int(poster_h * 590 / poster_w)
+    poster = poster.resize((display_w, display_h), Image.Resampling.LANCZOS)
+    poster_x, poster_y = 72, (H - display_h) // 2
+
+    shadow = Image.new(
+        "RGBA", (display_w + 50, display_h + 50), (0, 0, 0, 0)
+    )
+    ImageDraw.Draw(shadow).rounded_rectangle(
+        (20, 20, display_w + 30, display_h + 30),
+        radius=18,
+        fill=(0, 0, 0, 180),
+    )
+    canvas.alpha_composite(
+        shadow.filter(ImageFilter.GaussianBlur(18)),
+        (poster_x - 24, poster_y - 24),
+    )
+    canvas.alpha_composite(poster.convert("RGBA"), (poster_x, poster_y))
+    draw = ImageDraw.Draw(canvas)
+
+    tx, maxw = 735, 1090
+    title = info["title"].upper()
+    title_font = font(72 if len(title) < 23 else 58, True)
+    y = put_lines(
+        draw, wrap(draw, title, title_font, maxw)[:2],
+        (tx, 95), title_font, "#FFFFFF", 8, 2, "#101322"
+    )
+
+    # Genres now appear directly below the anime title.
+    genres = info.get("genres", [])
+    genre_text = "  •  ".join(genres)
+    y += 12
+
+    if genre_text:
+        genre_font = font(27, True)
+        while (
+            draw.textbbox((0, 0), genre_text, font=genre_font)[2] > maxw
+            and genre_font.size > 18
+        ):
+            genre_font = font(genre_font.size - 1, True)
+
+        draw.text(
+            (tx, y),
+            genre_text,
+            font=genre_font,
+            fill="#FFCF78",
+        )
+        y += 44
+
+    draw.rounded_rectangle(
+        (tx, y, tx + 175, y + 9), radius=4, fill="#FF3158"
+    )
+    y += 35
+    draw.text((tx, y), "SYNOPSIS", font=font(29, True), fill="#FFB547")
+    y += 48
+
+    synopsis = re.sub(
+        r"\s+", " ", info.get("overview", "")
+    ).strip() or "Synopsis unavailable."
+    if len(synopsis) > 620:
+        synopsis = synopsis[:620].rsplit(" ", 1)[0].rstrip(" ,;:-") + "…"
+    synopsis_lines = wrap(draw, synopsis, font(25), maxw)[:8]
+    y = put_lines(
+        draw, synopsis_lines, (tx, y), font(25), "#F0F1FA", 10
+    )
+
+    # Genres are intentionally not repeated here.
+    metadata = []
+    if info.get("year"):
+        metadata.append(info["year"])
+    if info.get("rating"):
+        try:
+            metadata.append(f"TMDB ★ {float(info['rating']):.1f}/10")
+        except (ValueError, TypeError):
+            pass
+
+    meta_y = min(max(y + 8, 620), 680)
+    if metadata:
+        meta_font = font(21, True)
+        put_lines(
+            draw,
+            wrap(draw, "  •  ".join(metadata), meta_font, maxw)[:2],
+            (tx, meta_y),
+            meta_font,
+            "#FFCF78",
+            7,
+        )
+
+    # Larger quality buttons, Tamil audio and Telegram banner.
+    draw_quality_buttons(draw, tx, 755, maxw)
+    draw.text(
+        (tx, 845),
+        "🔊  " + DEFAULT_AUDIO,
+        font=font(27, True),
+        fill="#FFFFFF",
+        stroke_width=1,
+        stroke_fill="#111222",
+    )
+    draw_telegram_join(draw, tx, 910, 930, settings["channel_username"])
+
+    # Existing channel logo and watermark.
+    if LOGO.exists():
+        try:
+            logo = Image.open(LOGO).convert("RGBA")
+            logo.thumbnail((155, 105), Image.Resampling.LANCZOS)
+            logo.putalpha(
+                logo.getchannel("A").point(lambda alpha: int(alpha * 0.95))
+            )
+            canvas.alpha_composite(
+                logo, (W - logo.width - 40, H - logo.height - 34)
+            )
+        except Exception:
+            log.exception("Could not load channel logo")
+
+    draw = ImageDraw.Draw(canvas)
+    draw.text(
+        (W - 35, H - 8),
+        settings["brand_name"].upper(),
+        font=font(19, True),
+        fill="#FFFFFF",
+        anchor="rs",
+        stroke_width=2,
+        stroke_fill="#111222",
+    )
+
+    output = io.BytesIO()
+    canvas.convert("RGB").save(
+        output, format="JPEG", quality=94, optimize=True
+    )
+    output.seek(0)
+    safe_title = re.sub(
+        r"[^a-zA-Z0-9_-]+", "-", info["title"]
+    ).strip("-").lower()
+    output.name = (safe_title or "anime") + "-ANIFLIX.jpg"
+    return output
+
+
+def poster_keyboard():
+    """Real clickable Telegram buttons shown below the poster photo."""
+    settings = load_bot_settings()
+    rows = []
+    if settings["watch_now_url"]:
+        rows.append([
+            InlineKeyboardButton("▶️ Watch Now", url=settings["watch_now_url"])
+        ])
+    if settings["join_telegram_url"]:
+        rows.append([
+            InlineKeyboardButton("✈️ Join Telegram", url=settings["join_telegram_url"])
+        ])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+# -------------------- Saved poster templates --------------------
+
+def load_template_data():
+    TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+    if not TEMPLATES_FILE.exists():
+        return {"templates": {}, "active": None}
+    try:
+        data = json.loads(TEMPLATES_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Invalid template data")
+        data.setdefault("templates", {})
+        data.setdefault("active", None)
+        return data
+    except (OSError, ValueError, json.JSONDecodeError):
+        log.exception("Could not read saved template data")
+        return {"templates": {}, "active": None}
+
+
+def save_template_data(data):
+    TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+    temp_file = TEMPLATES_FILE.with_suffix(".tmp")
+    temp_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    temp_file.replace(TEMPLATES_FILE)
+
+
+def is_template_admin(update):
+    if not ADMIN_USER_ID:
+        return False
+    user = update.effective_user
+    return bool(user and str(user.id) == ADMIN_USER_ID)
+
+
+def template_key(name):
+    return re.sub(r"\s+", " ", name).strip().casefold()
+
+
+def template_keyboard(action):
+    data = load_template_data()
+    rows = []
+    for key, item in sorted(data["templates"].items(), key=lambda pair: pair[1]["name"].casefold()):
+        token = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+        rows.append([InlineKeyboardButton(item["name"], callback_data=f"template:{action}:{token}")])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def addtemplate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_template_admin(update):
+        await update.effective_message.reply_text(
+            "⛔ Template management is admin-only. Set ADMIN_USER_ID in Render Environment."
+        )
+        return
+    name = " ".join(context.args).strip()
+    if not name:
+        context.user_data["template_state"] = "name"
+        await update.effective_message.reply_text("Send a name for this template.\nSend /cancel to stop.")
+        return
+    await begin_template_image(update, context, name)
+
+
+async def begin_template_image(update, context, name):
+    if len(name) > 50:
+        await update.effective_message.reply_text("Template names must be 50 characters or fewer.")
+        return
+    key = template_key(name)
+    if not key:
+        await update.effective_message.reply_text("Please send a valid template name.")
+        return
+    data = load_template_data()
+    if key in data["templates"]:
+        await update.effective_message.reply_text("That template name already exists. Choose another name or delete the old one first.")
+        return
+    context.user_data["template_pending_name"] = name.strip()
+    context.user_data["template_state"] = "image"
+    await update.effective_message.reply_text(
+        f"🖼 Send the blank template image for **{name.strip()}** now.\n\n"
+        "Use a 16:9 image with an empty artwork area on the left and space for title/details on the right.\n"
+        "Send /cancel to stop.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def template_upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("template_state") != "image":
+        return
+    if not is_template_admin(update):
+        return
+    message = update.effective_message
+    photo = message.photo[-1] if message.photo else None
+    document = message.document if message.document and (message.document.mime_type or "").startswith("image/") else None
+    if not photo and not document:
+        await message.reply_text("Please send the template as a photo or image file.")
+        return
+    file_id = photo.file_id if photo else document.file_id
+    try:
+        tg_file = await context.bot.get_file(file_id)
+        image_bytes = io.BytesIO()
+        await tg_file.download_to_memory(out=image_bytes)
+        image_bytes.seek(0)
+        with Image.open(image_bytes) as check:
+            check.verify()
+        image_bytes.seek(0)
+        with Image.open(image_bytes) as check:
+            if check.width < 640 or check.height < 360:
+                await message.reply_text("Image is too small. Please send at least 640×360 pixels.")
+                return
+            check.convert("RGB").save(image_bytes := io.BytesIO(), format="PNG", optimize=True)
+        name = context.user_data.get("template_pending_name", "Template")
+        key = template_key(name)
+        TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+        image_path = TEMPLATES_DIR / (hashlib.sha256(key.encode("utf-8")).hexdigest()[:20] + ".png")
+        image_bytes.seek(0)
+        image_path.write_bytes(image_bytes.getvalue())
+        data = load_template_data()
+        data["templates"][key] = {"name": name, "file": image_path.name}
+        save_template_data(data)
+        context.user_data.pop("template_state", None)
+        context.user_data.pop("template_pending_name", None)
+        await message.reply_text(
+            f"✅ Template **{name}** saved!\nUse /templates to view it and /settemplate to activate it.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as error:
+        log.exception("Template upload failed")
+        await message.reply_text(f"⚠️ Could not save that image: {error}")
+
+
+async def templates_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_template_data()
+    if not data["templates"]:
+        await update.effective_message.reply_text("No saved templates yet. Use /addtemplate to add one.")
+        return
+    active = data.get("active")
+    lines = ["🎨 Saved templates:"]
+    for key, item in sorted(data["templates"].items(), key=lambda pair: pair[1]["name"].casefold()):
+        marker = " ⭐ ACTIVE" if key == active else ""
+        lines.append(f"• {item['name']}{marker}")
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+async def settemplate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_template_admin(update):
+        await update.effective_message.reply_text("⛔ Only the bot admin can change the active template.")
+        return
+    data = load_template_data()
+    if not data["templates"]:
+        await update.effective_message.reply_text("No templates saved. Use /addtemplate first.")
+        return
+    name = " ".join(context.args).strip()
+    if name:
+        key = template_key(name)
+        if key not in data["templates"]:
+            await update.effective_message.reply_text("Template not found. Use /templates to see saved names.")
+            return
+        data["active"] = key
+        save_template_data(data)
+        await update.effective_message.reply_text(f"✅ Active template: {data['templates'][key]['name']}")
+        return
+    await update.effective_message.reply_text("Choose the template to activate:", reply_markup=template_keyboard("set"))
+
+
+async def deletetemplate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_template_admin(update):
+        await update.effective_message.reply_text("⛔ Only the bot admin can delete templates.")
+        return
+    data = load_template_data()
+    if not data["templates"]:
+        await update.effective_message.reply_text("No saved templates to delete.")
+        return
+    name = " ".join(context.args).strip()
+    if name:
+        await delete_template_by_key(update, context, template_key(name))
+        return
+    await update.effective_message.reply_text("Choose a template to delete:", reply_markup=template_keyboard("delete"))
+
+
+async def delete_template_by_key(update, context, key):
+    data = load_template_data()
+    item = data["templates"].pop(key, None)
+    if not item:
+        await update.effective_message.reply_text("Template not found.")
+        return
+    image_path = TEMPLATES_DIR / item.get("file", "")
+    if image_path.is_file() and image_path.parent == TEMPLATES_DIR:
+        image_path.unlink(missing_ok=True)
+    if data.get("active") == key:
+        data["active"] = None
+    save_template_data(data)
+    await update.effective_message.reply_text(f"🗑 Deleted template: {item['name']}")
+
+
+async def template_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_template_admin(update):
+        await query.answer("Admin only", show_alert=True)
+        return
+    await query.answer()
+    _, action, token = query.data.split(":", 2)
+    data = load_template_data()
+    key = next((stored_key for stored_key in data["templates"] if hashlib.sha256(stored_key.encode("utf-8")).hexdigest()[:16] == token), None)
+    if key is None:
+        await query.edit_message_text("That template no longer exists.")
+        return
+    if action == "set":
+        data["active"] = key
+        save_template_data(data)
+        await query.edit_message_text(f"✅ Active template set to: {data['templates'][key]['name']}")
+    elif action == "delete":
+        item = data["templates"].pop(key)
+        image_path = TEMPLATES_DIR / item.get("file", "")
+        if image_path.is_file() and image_path.parent == TEMPLATES_DIR:
+            image_path.unlink(missing_ok=True)
+        if data.get("active") == key:
+            data["active"] = None
+        save_template_data(data)
+        await query.edit_message_text(f"🗑 Deleted template: {item['name']}")
+
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("template_state", None)
+    context.user_data.pop("template_pending_name", None)
+    await update.effective_message.reply_text("Template setup cancelled.")
+
+
+async def template_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("template_state") != "name":
+        await text_fallback(update, context)
+        return
+    if not is_template_admin(update):
+        await update.effective_message.reply_text("⛔ Only the bot admin can add templates.")
+        return
+    await begin_template_image(update, context, update.effective_message.text.strip())
+
+
+async def setusername_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_template_admin(update):
+        await update.effective_message.reply_text("⛔ Only the bot admin can change usernames. Set ADMIN_USER_ID in Render Environment.")
+        return
+    username = " ".join(context.args).strip()
+    if not username:
+        await update.effective_message.reply_text("Usage: /setusername @YourChannelUsername")
+        return
+    if not re.fullmatch(r"@?[A-Za-z0-9_]{5,32}", username):
+        await update.effective_message.reply_text("Please send a valid Telegram username, for example: /setusername @ANIFLIXANIMETAMIL")
+        return
+    if not username.startswith("@"): 
+        username = "@" + username
+    settings = load_bot_settings()
+    settings["channel_username"] = username
+    save_bot_settings(settings)
+    await update.effective_message.reply_text(f"✅ Poster username updated to {username}")
+
+
+async def setlinks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_template_admin(update):
+        await update.effective_message.reply_text("⛔ Only the bot admin can change poster links.")
+        return
+    raw = " ".join(context.args).strip()
+    parts = [part.strip() for part in raw.split("|")]
+    if len(parts) != 2 or not all(parts):
+        await update.effective_message.reply_text("Usage:\n/setlinks https://t.me/WatchChannel | https://t.me/JoinChannel\nFirst link = Watch Now button; second link = Join Telegram button.")
+        return
+    if not all(re.match(r"^https://", part, re.I) for part in parts):
+        await update.effective_message.reply_text("Both links must start with https://")
+        return
+    settings = load_bot_settings()
+    settings["watch_now_url"], settings["join_telegram_url"] = parts
+    save_bot_settings(settings)
+    await update.effective_message.reply_text("✅ Watch Now and Join Telegram links updated.")
+
+
+async def setbrand_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_template_admin(update):
+        await update.effective_message.reply_text("⛔ Only the bot admin can change the poster brand text.")
+        return
+    brand = " ".join(context.args).strip()
+    if not brand or len(brand) > 32:
+        await update.effective_message.reply_text("Usage: /setbrand ANIFLIX INFINITY (up to 32 characters)")
+        return
+    settings = load_bot_settings()
+    settings["brand_name"] = brand
+    save_bot_settings(settings)
+    await update.effective_message.reply_text(f"✅ Poster watermark text updated to: {brand}")
+
+
+async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    settings = load_bot_settings()
+    await update.effective_message.reply_text(
+        "⚙️ Current poster settings\n"
+        f"Username: {settings['channel_username']}\n"
+        f"Watch Now: {settings['watch_now_url']}\n"
+        f"Join Telegram: {settings['join_telegram_url']}\n"
+        f"Watermark: {settings['brand_name']}\n\n"
+        "Admin commands: /setusername, /setlinks, /setbrand"
+    )
+
+
+# -------------------- Telegram commands --------------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "🎌 Welcome to ANIFLIX INFINITY Poster Bot!\n\n"
+        "Create 16:9 (1920×1080) anime posters with synopsis, year, rating, "
+        "genres below the title, large quality buttons, a Telegram logo banner, "
+        "channel logo and watermark.\n\n"
+        "Commands:\n"
+        "/poster <anime name>\n"
+        "/search <anime name>\n"
+        "/synopsis <anime name>\n"
+        "/addtemplate [name] (admin)\n"
+        "/templates\n"
+        "/settemplate [name] (admin)\n"
+        "/deletetemplate [name] (admin)\n"
+        "/setusername @username (admin)\n"
+        "/setlinks watch_url | join_url (admin)\n"
+        "/setbrand [text] (admin)\n"
+        "/settings\n"
+        "/help"
+    )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "Commands:\n"
+        "/poster <anime name> — create a 16:9 poster\n"
+        "/search <anime name> — search titles\n"
+        "/synopsis <anime name> — get synopsis and metadata\n"
+        "/addtemplate [name] — save a blank poster template (admin)\n"
+        "/templates — list saved templates\n"
+        "/settemplate [name] — select active template (admin)\n"
+        "/deletetemplate [name] — delete a template (admin)\n"
+        "/cancel — cancel template setup\n"
+        "/setusername @username — edit displayed channel username (admin)\n"
+        "/setlinks watch_url | join_url — edit poster buttons (admin)\n"
+        "/setbrand [text] — edit watermark text (admin)\n"
+        "/settings — show current poster settings\n"
+        "/help — show commands\n\n"
+        "Example: /poster Naruto Shippuden"
+    )
+
+
+async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = " ".join(context.args).strip()
+    if not query:
+        await update.effective_message.reply_text(
+            "Usage: /poster <anime name>\nExample: /poster Solo Leveling"
+        )
+        return
+
+    message = await update.effective_message.reply_text("🔎 Searching TMDB…")
+    try:
+        items = search(query)
+        if not items:
+            await message.edit_text(
+                "No poster results found. Try another spelling."
+            )
+            return
+
+        context.user_data["results"] = {
+            str(index): item for index, item in enumerate(items)
+        }
+        buttons = []
+        for index, item in enumerate(items):
+            label = item["title"] + (
+                f" ({item['date'][:4]})" if item["date"] else ""
+            )
+            buttons.append([
+                InlineKeyboardButton(
+                    label[:58], callback_data=f"poster:{index}"
+                )
+            ])
+        await message.edit_text(
+            "Choose the correct title:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+    except Exception as error:
+        log.exception("Search failed")
+        await message.edit_text(f"⚠️ Search failed: {error}")
+
+
+async def synopsis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = " ".join(context.args).strip()
+    if not query:
+        await update.effective_message.reply_text(
+            "Usage: /synopsis <anime name>"
+        )
+        return
+
+    try:
+        items = search(query)
+        if not items:
+            await update.effective_message.reply_text(
+                "No matching title found."
+            )
+            return
+
+        data = details(items[0])
+        message = f"📺 {data['title']}\n\n{data['overview'][:900]}"
+        if data["year"]:
+            message += f"\n\n📅 Year: {data['year']}"
+        if data["rating"]:
+            message += f"\n⭐ TMDB rating: {float(data['rating']):.1f}/10"
+        if data["genres"]:
+            message += "\n🎭 Genres: " + ", ".join(data["genres"])
+        settings = load_bot_settings()
+        message += (
+            f"\n\n🎞 {DEFAULT_QUALITY}\n"
+            f"🔊 {DEFAULT_AUDIO}\n"
+            f"✈️ Telegram Join → {settings['channel_username']}"
+        )
+        await update.effective_message.reply_text(message)
+    except Exception as error:
+        log.exception("Synopsis lookup failed")
+        await update.effective_message.reply_text(
+            f"⚠️ Could not retrieve synopsis: {error}"
+        )
+
+
+async def poster_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    index = query.data.split(":", 1)[1]
+    item = context.user_data.get("results", {}).get(index)
+    if not item:
+        await query.edit_message_text(
+            "Search expired. Please run /poster again."
+        )
+        return
+
+    await query.edit_message_text(
+        f"🎨 Creating 1920×1080 poster for {item['title']}…"
+    )
+    try:
+        data = details(item)
+        template_data = load_template_data()
+        active_key = template_data.get("active")
+        active_template = template_data.get("templates", {}).get(active_key) if active_key else None
+        template_path = (TEMPLATES_DIR / active_template["file"]) if active_template else None
+        if template_path and not template_path.is_file():
+            template_path = None
+        image = make_poster(data, template_path=template_path)
+
+        title = html.escape(data["title"])
+        caption = f"🎌 <b>{title}</b>"
+        if data["genres"]:
+            caption += f"\n🎭 {html.escape(', '.join(data['genres']))}"
+        if data["year"]:
+            caption += f"\n📅 {html.escape(data['year'])}"
+        if data["rating"]:
+            caption += f"  ⭐ {float(data['rating']):.1f}/10"
+
+        settings = load_bot_settings()
+        quote = (
+            f"🎞 {html.escape(DEFAULT_QUALITY)}\n"
+            f"🔊 {html.escape(DEFAULT_AUDIO)}\n"
+            f"✈️ Telegram Join → {html.escape(settings['channel_username'])}\n\n"
+            f"{html.escape(settings['brand_name'])}"
+        )
+        caption += f"\n\n<blockquote expandable>{quote}</blockquote>"
+
+        await context.bot.send_photo(
+            chat_id=query.message.chat_id,
+            photo=image,
+            caption=caption[:1024],
+            parse_mode=ParseMode.HTML,
+            reply_markup=poster_keyboard(),
+        )
+        await query.message.reply_text(
+            "✅ Poster ready! Genres are displayed directly below the anime "
+            "title. The Watch Now and Join Telegram buttons below the image "
+            "are clickable."
+        )
+    except Exception as error:
+        log.exception("Poster creation failed")
+        await query.message.reply_text(f"⚠️ Couldn't create poster: {error}")
+
+
+async def text_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "Use /poster followed by an anime name.\n"
+        "Example: /poster Naruto Shippuden"
+    )
+
+
+def main():
+    if not BOT_TOKEN:
+        raise SystemExit("Missing TELEGRAM_BOT_TOKEN in Render Environment.")
+    if not TMDB_TOKEN and not TMDB_KEY:
+        raise SystemExit(
+            "Missing TMDB_READ_ACCESS_TOKEN or TMDB_API_KEY in Render Environment."
+        )
+
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("poster", search_cmd))
+    app.add_handler(CommandHandler("search", search_cmd))
+    app.add_handler(CommandHandler("synopsis", synopsis_cmd))
+    app.add_handler(CommandHandler("addtemplate", addtemplate_cmd))
+    app.add_handler(CommandHandler("templates", templates_cmd))
+    app.add_handler(CommandHandler("settemplate", settemplate_cmd))
+    app.add_handler(CommandHandler("deletetemplate", deletetemplate_cmd))
+    app.add_handler(CommandHandler("setusername", setusername_cmd))
+    app.add_handler(CommandHandler("setlinks", setlinks_cmd))
+    app.add_handler(CommandHandler("setbrand", setbrand_cmd))
+    app.add_handler(CommandHandler("settings", settings_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
+    app.add_handler(CallbackQueryHandler(template_callback, pattern=r"^template:(set|delete):"))
+    app.add_handler(CallbackQueryHandler(poster_callback, pattern=r"^poster:\d+$"))
+    app.add_handler(MessageHandler((filters.PHOTO | filters.Document.IMAGE), template_upload_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, template_name_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_fallback))
+
+    log.info("ANIFLIX INFINITY Poster Bot started")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    threading.Thread(target=run_web_server, daemon=True).start()
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+    main()
